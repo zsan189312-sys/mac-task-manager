@@ -1,21 +1,24 @@
-// 渲染进程：UI + 图表（Windows 式 P/E 核心分离 · macOS 视觉）
+// 渲染进程：UI + 图表（P/E 核心分离 · GPU 监测 · 增量更新架构）
 const HIST = 60;
 const hist = {
-  cpu: [], cpuP: [], cpuE: [], mem: [], disk: [],
+  cpu: [], cpuP: [], cpuE: [], mem: [], disk: [], gpu: [],
   netrx: [], nettx: [], batt: [], cores: []
 };
 
 const cards = [
   { id: 'cpu',  title: 'CPU',  color: '#0a84ff' },
   { id: 'mem',  title: '内存', color: '#bf5af2' },
+  { id: 'gpu',  title: 'GPU',  color: '#64d2ff' },
   { id: 'disk', title: '磁盘', color: '#30d158' },
   { id: 'net',  title: 'Wi-Fi', color: '#ffd60a' },
   { id: 'batt', title: '电池', color: '#30d158' }
 ];
+const cardColor = Object.fromEntries(cards.map(c => [c.id, c.color]));
 let activeCard = 'cpu';
 let latest = null;
 let procSort = 'cpu';
 let procQuery = '';
+let bodyBuilt = false; // detail-body 是否已按当前卡片构建
 
 // ---------- 工具 ----------
 function fmtSize(b) {
@@ -36,6 +39,7 @@ function push(arr, v) { arr.push(v); if (arr.length > HIST) arr.shift(); }
 function esc(s) {
   return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 }
+function setText(id, v) { const el = document.getElementById(id); if (el && el.textContent !== v) el.textContent = v; }
 
 function setupCanvas(cv) {
   const dpr = window.devicePixelRatio || 1;
@@ -84,42 +88,35 @@ function buildSidebar() {
         <div class="card-sub" id="sub-${c.id}">正在采样…</div>
       </div>
       <canvas id="spark-${c.id}"></canvas>`;
-    el.onclick = () => { activeCard = c.id; buildSidebar(); renderDetail(); };
+    el.onclick = () => { activeCard = c.id; bodyBuilt = false; buildSidebar(); tickDetail(true); };
     sb.appendChild(el);
   });
 }
 
 function updateSidebar(d) {
-  const set = (id, txt) => { const el = document.getElementById('sub-' + id); if (el) el.textContent = txt; };
   const c = d.cpu, m = d.mem;
   const pe = (c.pUsage !== null && c.eUsage !== null)
     ? ` · P ${c.pUsage.toFixed(0)}% / E ${c.eUsage.toFixed(0)}%` : '';
-  set('cpu', `${c.usage.toFixed(0)}%${pe}`);
-  set('mem', `${fmtSize(m.used)} / ${fmtSize(m.total)}`);
+  setText('sub-cpu', `${c.usage.toFixed(0)}%${pe}`);
+  setText('sub-mem', `${fmtSize(m.used)} / ${fmtSize(m.total)}`);
   const vol = (d.disk.volumes.find(v => v.mount === '/') || d.disk.volumes[0]) || {};
-  set('disk', `${fmtSize(vol.used)} / ${fmtSize(vol.total)} · ${fmtRate(d.disk.mbps * 1024 * 1024)}`);
+  setText('sub-disk', `${fmtSize(vol.used)} / ${fmtSize(vol.total)} · ${fmtRate(d.disk.mbps * 1024 * 1024)}`);
   const en0 = d.net.ifaces.find(i => i.name === 'en0') || d.net.ifaces[0];
-  set('net', d.wifi ? `Wi-Fi · ${d.wifi}` : (en0 ? en0.name : '未连接'));
-  set('batt', d.batt.present ? `${d.batt.percent}%${d.batt.charging ? ' · 充电中' : ''}` : '无电池');
+  setText('sub-net', d.wifi ? `Wi-Fi · ${d.wifi}` : (en0 ? en0.name : '未连接'));
+  setText('sub-batt', d.batt.present ? `${d.batt.percent}%${d.batt.charging ? ' · 充电中' : ''}` : '无电池');
+  setText('sub-gpu', d.gpu.util === null ? '—' : `${d.gpu.util.toFixed(0)}% · ${fmtSize(d.gpu.memBytes)}`);
 
-  const series = {
-    cpu: hist.cpu, mem: hist.mem, disk: hist.disk,
-    net: hist.netrx, batt: hist.batt
-  };
-  cards.forEach(cd => {
-    const cv = document.getElementById('spark-' + cd.id);
-    if (!cv) return;
-    if (cd.id === 'net') {
-      drawSeries(cv, hist.netrx, '#ffd60a');
-      drawSeries(cv, hist.nettx, '#ff453a');
-    } else {
-      drawSeries(cv, series[cd.id], cd.color);
-    }
-  });
+  drawSeries(document.getElementById('spark-cpu'), hist.cpu, '#0a84ff');
+  drawSeries(document.getElementById('spark-mem'), hist.mem, '#bf5af2', 100);
+  drawSeries(document.getElementById('spark-gpu'), hist.gpu, '#64d2ff', 100);
+  drawSeries(document.getElementById('spark-disk'), hist.disk, '#30d158');
+  drawSeries(document.getElementById('spark-net'), hist.netrx, '#ffd60a');
+  drawSeries(document.getElementById('spark-net'), hist.nettx, '#ff453a');
+  drawSeries(document.getElementById('spark-batt'), hist.batt, '#30d158', 100);
 }
 
-// ---------- 详情 ----------
-const titleMap = { cpu: 'CPU', mem: '内存', disk: '磁盘', net: '网络', batt: '电池' };
+// ---------- 详情：build（切换时一次） / update（每帧增量） ----------
+const titleMap = { cpu: 'CPU', mem: '内存', gpu: 'GPU', disk: '磁盘', net: '网络', batt: '电池' };
 
 function drawOverlaid(cv, primary, secondary, c1, c2, yMax) {
   drawSeries(cv, primary, c1, yMax);
@@ -137,176 +134,235 @@ function drawOverlaid(cv, primary, secondary, c1, c2, yMax) {
   ctx.strokeStyle = c2; ctx.lineWidth = 1.5; ctx.lineJoin = 'round'; ctx.stroke();
 }
 
-const detailRenderers = {
-  cpu(d) {
-    const st = d.staticInfo;
-    document.getElementById('detail-meta').textContent =
-      `${st.chip} · ${st.perfCount} 性能核 + ${st.effCount} 能效核`;
-    document.getElementById('chart-max').textContent = '';
-    drawSeries(document.getElementById('bigchart'), hist.cpu, '#0a84ff');
-
-    // P / E 双面板
-    const pVal = d.cpu.pUsage === null ? '—' : d.cpu.pUsage.toFixed(0) + '%';
-    const eVal = d.cpu.eUsage === null ? '—' : d.cpu.eUsage.toFixed(0) + '%';
-    let html = `
-      <div class="pe-grid">
-        <div class="panel">
-          <div class="panel-head">
-            <span class="panel-title"><span class="chip chip-p">P</span>性能核心（${st.perfCount} 核）</span>
-            <span class="panel-value" style="color:var(--p-core)">${pVal}</span>
+const detailDefs = {
+  cpu: {
+    build(d) {
+      const st = d.staticInfo;
+      let html = `
+        <div class="pe-grid">
+          <div class="panel">
+            <div class="panel-head">
+              <span class="panel-title"><span class="chip chip-p">P</span>性能核心（${st.perfCount} 核）</span>
+              <span class="panel-value" style="color:var(--p-core)" id="p-val">—</span>
+            </div>
+            <canvas id="pe-p"></canvas>
           </div>
-          <canvas id="pe-p"></canvas>
+          <div class="panel">
+            <div class="panel-head">
+              <span class="panel-title"><span class="chip chip-e">E</span>能效核心（${st.effCount} 核）</span>
+              <span class="panel-value" style="color:var(--e-core)" id="e-val">—</span>
+            </div>
+            <canvas id="pe-e"></canvas>
+          </div>
         </div>
-        <div class="panel">
-          <div class="panel-head">
-            <span class="panel-title"><span class="chip chip-e">E</span>能效核心（${st.effCount} 核）</span>
-            <span class="panel-value" style="color:var(--e-core)">${eVal}</span>
-          </div>
-          <canvas id="pe-e"></canvas>
-        </div>
-      </div>`;
-
-    // 每核小图块
-    html += `<div class="section-title">逻辑核心</div><div class="tiles" id="core-tiles">`;
-    d.cpu.coreLoads.forEach((v, i) => {
-      const isP = st.coreTypes[i] === 'P';
-      html += `
-        <div class="tile">
-          <div class="tile-head">
-            <span class="tile-name"><b style="color:${isP ? 'var(--p-core)' : 'var(--e-core)'}">${isP ? 'P' : 'E'}${isP ? i : i - st.perfCount}</b> 核心 ${i}</span>
-            <span class="tile-val" id="tile-val-${i}">${v.toFixed(0)}%</span>
-          </div>
-          <canvas id="tile-cv-${i}"></canvas>
+        <div class="section-title">逻辑核心</div><div class="tiles">`;
+      d.cpu.coreLoads.forEach((v, i) => {
+        const isP = st.coreTypes[i] === 'P';
+        html += `
+          <div class="tile">
+            <div class="tile-head">
+              <span class="tile-name"><b style="color:${isP ? 'var(--p-core)' : 'var(--e-core)'}">${isP ? 'P' : 'E'}${isP ? i : i - st.perfCount}</b> 核心 ${i}</span>
+              <span class="tile-val" id="tile-val-${i}">—</span>
+            </div>
+            <canvas id="tile-cv-${i}"></canvas>
+          </div>`;
+      });
+      html += `</div>
+        <div class="info-grid">
+          <div class="info-item"><div class="info-label">总利用率</div><div class="info-value" id="cpu-total">—</div></div>
+          <div class="info-item"><div class="info-label">用户 / 系统</div><div class="info-value" id="cpu-us">—</div></div>
+          <div class="info-item"><div class="info-label">空闲</div><div class="info-value" id="cpu-idle">—</div></div>
+          <div class="info-item"><div class="info-label">负载均值 (1/5/15 分钟)</div><div class="info-value" id="cpu-load">—</div></div>
         </div>`;
-    });
-    html += `</div>`;
-
-    const la = d.cpu.loadAvg;
-    html += `
-      <div class="info-grid">
-        <div class="info-item"><div class="info-label">总利用率</div><div class="info-value">${d.cpu.usage.toFixed(1)}%</div></div>
-        <div class="info-item"><div class="info-label">用户 / 系统</div><div class="info-value">${d.cpu.user.toFixed(1)}% <small>/</small> ${d.cpu.sys.toFixed(1)}%</div></div>
-        <div class="info-item"><div class="info-label">空闲</div><div class="info-value">${d.cpu.idle.toFixed(1)}%</div></div>
-        <div class="info-item"><div class="info-label">负载均值 (1/5/15 分钟)</div><div class="info-value">${(la[0]||0).toFixed(2)} <small>/</small> ${(la[1]||0).toFixed(2)} <small>/</small> ${(la[2]||0).toFixed(2)}</div></div>
-      </div>`;
-    return html;
+      return html;
+    },
+    update(d) {
+      setText('p-val', d.cpu.pUsage === null ? '—' : d.cpu.pUsage.toFixed(0) + '%');
+      setText('e-val', d.cpu.eUsage === null ? '—' : d.cpu.eUsage.toFixed(0) + '%');
+      drawSeries(document.getElementById('pe-p'), hist.cpuP, '#0a84ff', 100);
+      drawSeries(document.getElementById('pe-e'), hist.cpuE, '#30d158', 100);
+      d.cpu.coreLoads.forEach((v, i) => {
+        setText('tile-val-' + i, v.toFixed(0) + '%');
+        const cv = document.getElementById('tile-cv-' + i);
+        if (cv) drawSeries(cv, hist.cores[i], d.staticInfo.coreTypes[i] === 'P' ? '#0a84ff' : '#30d158', 100);
+      });
+      setText('cpu-total', d.cpu.usage.toFixed(1) + '%');
+      setText('cpu-us', `${d.cpu.user.toFixed(1)}% / ${d.cpu.sys.toFixed(1)}%`);
+      setText('cpu-idle', d.cpu.idle.toFixed(1) + '%');
+      const la = d.cpu.loadAvg;
+      setText('cpu-load', `${(la[0]||0).toFixed(2)} / ${(la[1]||0).toFixed(2)} / ${(la[2]||0).toFixed(2)}`);
+    },
+    meta(d) { return `${d.staticInfo.chip} · ${d.staticInfo.perfCount} 性能核 + ${d.staticInfo.effCount} 能效核`; }
   },
-  mem(d) {
-    const m = d.mem;
-    document.getElementById('detail-meta').textContent = `${fmtSize(m.total)} 统一内存`;
-    document.getElementById('chart-max').textContent = '';
-    drawSeries(document.getElementById('bigchart'), hist.mem, '#bf5af2', 100);
-    const rows = [
-      ['已使用', m.used, '#bf5af2'],
-      ['App 内存（活跃）', m.active, '#0a84ff'],
-      ['联动内存（Wired）', m.wired, '#ff453a'],
-      ['已压缩', m.compressed, '#ffd60a'],
-      ['非活跃', m.inactive, '#30d158'],
-      ['可用', m.avail, 'rgba(235,240,248,0.3)']
-    ];
-    return `
-      <div class="info-grid">
-        <div class="info-item"><div class="info-label">物理内存</div><div class="info-value">${fmtSize(m.used)} <small>/ ${fmtSize(m.total)}</small></div></div>
-        <div class="info-item"><div class="info-label">内存占用率</div><div class="info-value">${(m.used / m.total * 100).toFixed(0)}%</div></div>
-        <div class="info-item"><div class="info-label">压缩器压力</div><div class="info-value">${m.pressure.toFixed(1)}%</div></div>
-        <div class="info-item"><div class="info-label">交换分区 (Swap)</div><div class="info-value">${fmtSize(m.swapUsed)} <small>/ ${fmtSize(m.swapTotal)}</small></div></div>
-      </div>
-      <div class="section-title">内存构成</div>
-      ${rows.map(([label, v, color]) => `
-        <div class="bar-row">
-          <span class="bar-label">${label}</span>
-          <div class="bar-track"><div class="bar-fill" style="width:${(v / m.total * 100).toFixed(1)}%;background:${color}"></div></div>
-          <span class="bar-num">${fmtSize(v)}</span>
-        </div>`).join('')}`;
+  gpu: {
+    build(d) {
+      const g = d.staticInfo.gpu || {};
+      return `
+        <div class="info-grid">
+          <div class="info-item"><div class="info-label">GPU 利用率</div><div class="info-value" style="color:var(--p-core)" id="gpu-util">—</div></div>
+          <div class="info-item"><div class="info-label">渲染器 / 分块器</div><div class="info-value" id="gpu-rt">—</div></div>
+          <div class="info-item"><div class="info-label">GPU 显存占用</div><div class="info-value" id="gpu-mem">—</div></div>
+          <div class="info-item"><div class="info-label">规格</div><div class="info-value" style="font-size:13px">${esc(d.staticInfo.chip)} GPU${g.cores ? ' · ' + g.cores + ' 核' : ''}${g.metal ? ' · ' + esc(g.metal) : ''}</div></div>
+        </div>
+        <div class="section-title">GPU 利用率曲线（IOAccelerator 实时采样）</div>`;
+    },
+    update(d) {
+      setText('gpu-util', d.gpu.util === null ? '—' : d.gpu.util.toFixed(0) + '%');
+      setText('gpu-rt', d.gpu.renderer === null ? '—' : `${d.gpu.renderer.toFixed(0)}% / ${d.gpu.tiler === null ? '—' : d.gpu.tiler.toFixed(0) + '%'}`);
+      setText('gpu-mem', d.gpu.memBytes === null ? '—' : fmtSize(d.gpu.memBytes));
+    },
+    meta() { return 'IOAccelerator 用户态采样 · 无需 sudo'; }
   },
-  disk(d) {
-    document.getElementById('detail-meta').textContent = `读写吞吐合计（macOS 磁盘层不区分读写）`;
-    drawSeries(document.getElementById('bigchart'), hist.disk, '#30d158');
-    document.getElementById('chart-max').textContent = fmtRate(Math.max(...hist.disk, 0.0001) * 1024 * 1024);
-    const vols = d.disk.volumes.map(v => `
-      <tr>
-        <td>${esc(v.name)}</td>
-        <td style="color:var(--text-2)">${esc(v.mount)}</td>
-        <td>${fmtSize(v.used)} / ${fmtSize(v.total)}
-          <span class="usage-track"><span class="usage-fill" style="width:${(v.used / v.total * 100).toFixed(0)}%"></span></span>
-        </td>
-        <td>可用 ${fmtSize(v.avail)}</td>
-      </tr>`).join('');
-    return `
-      <div class="info-grid">
-        <div class="info-item"><div class="info-label">当前吞吐（读写合计）</div><div class="info-value">${fmtRate(d.disk.mbps * 1024 * 1024)}</div></div>
-        <div class="info-item"><div class="info-label">IOPS</div><div class="info-value">${d.disk.tps.toFixed(0)} <small>次/秒</small></div></div>
-        <div class="info-item"><div class="info-label">60 秒峰值</div><div class="info-value">${fmtRate(Math.max(...hist.disk, 0) * 1024 * 1024)}</div></div>
-      </div>
-      <div class="section-title">卷（APFS 容器）</div>
-      <table class="vol-table">
-        <thead><tr><th>卷</th><th>挂载点</th><th>容量</th><th style="text-align:right">可用</th></tr></thead>
-        <tbody>${vols}</tbody>
-      </table>`;
+  mem: {
+    build() {
+      return `
+        <div class="info-grid">
+          <div class="info-item"><div class="info-label">物理内存</div><div class="info-value" id="mem-used">—</div></div>
+          <div class="info-item"><div class="info-label">内存占用率</div><div class="info-value" id="mem-pct">—</div></div>
+          <div class="info-item"><div class="info-label">压缩器压力</div><div class="info-value" id="mem-pressure">—</div></div>
+          <div class="info-item"><div class="info-label">交换分区 (Swap)</div><div class="info-value" id="mem-swap">—</div></div>
+        </div>
+        <div class="section-title">内存构成</div><div id="mem-bars"></div>`;
+    },
+    update(d) {
+      const m = d.mem;
+      setText('mem-used', `${fmtSize(m.used)} / ${fmtSize(m.total)}`);
+      setText('mem-pct', (m.used / m.total * 100).toFixed(0) + '%');
+      setText('mem-pressure', m.pressure.toFixed(1) + '%');
+      setText('mem-swap', `${fmtSize(m.swapUsed)} / ${fmtSize(m.swapTotal)}`);
+      const rows = [
+        ['已使用', m.used, '#bf5af2'], ['App 内存（活跃）', m.active, '#0a84ff'],
+        ['联动内存（Wired）', m.wired, '#ff453a'], ['已压缩', m.compressed, '#ffd60a'],
+        ['非活跃', m.inactive, '#30d158'], ['可用', m.avail, 'rgba(235,240,248,0.3)']
+      ];
+      const bar = document.getElementById('mem-bars');
+      if (bar && !bar.dataset.built) {
+        bar.innerHTML = rows.map((r, i) => `
+          <div class="bar-row">
+            <span class="bar-label">${r[0]}</span>
+            <div class="bar-track"><div class="bar-fill" id="bar-mem-${i}" style="background:${r[2]}"></div></div>
+            <span class="bar-num" id="bar-num-${i}">—</span>
+          </div>`).join('');
+        bar.dataset.built = '1';
+      }
+      rows.forEach((r, i) => {
+        const f = document.getElementById('bar-mem-' + i);
+        if (f) f.style.width = (r[1] / m.total * 100).toFixed(1) + '%';
+        setText('bar-num-' + i, fmtSize(r[1]));
+      });
+    },
+    meta(d) { return `${fmtSize(d.mem.total)} 统一内存`; }
   },
-  net(d) {
-    const en0 = d.net.ifaces.find(i => i.name === 'en0') || d.net.ifaces[0] || { rxRate: 0, txRate: 0, ibytes: 0, obytes: 0, name: 'en0' };
-    document.getElementById('detail-meta').textContent = d.wifi ? `Wi-Fi · ${d.wifi}` : en0.name;
-    drawOverlaid(document.getElementById('bigchart'), hist.netrx, hist.nettx, '#ffd60a', '#ff453a');
-    document.getElementById('chart-max').textContent = fmtRate(Math.max(...hist.netrx, ...hist.nettx, 0.001));
-    const ifaces = d.net.ifaces.map(i => `
-      <tr>
-        <td>${esc(i.name)}${i.name === 'en0' ? ' <span style="color:var(--text-3)">（Wi-Fi）</span>' : ''}</td>
-        <td style="color:#ffd60a">↓ ${fmtRate(i.rxRate)}</td>
-        <td style="color:#ff453a">↑ ${fmtRate(i.txRate)}</td>
-        <td>累计收 ${fmtSize(i.ibytes)} / 发 ${fmtSize(i.obytes)}</td>
-      </tr>`).join('');
-    return `
-      <div class="info-grid">
-        <div class="info-item"><div class="info-label">接收速率 ↓</div><div class="info-value" style="color:#ffd60a">${fmtRate(en0.rxRate)}</div></div>
-        <div class="info-item"><div class="info-label">发送速率 ↑</div><div class="info-value" style="color:#ff453a">${fmtRate(en0.txRate)}</div></div>
-        <div class="info-item"><div class="info-label">本次开机累计接收</div><div class="info-value">${fmtSize(en0.ibytes)}</div></div>
-        <div class="info-item"><div class="info-label">本次开机累计发送</div><div class="info-value">${fmtSize(en0.obytes)}</div></div>
-      </div>
-      <div class="section-title">网络接口（<span style="color:#ffd60a">黄=接收</span> / <span style="color:#ff453a">红=发送</span>）</div>
-      <table class="vol-table">
-        <thead><tr><th>接口</th><th>接收</th><th>发送</th><th>累计</th></tr></thead>
-        <tbody>${ifaces}</tbody>
-      </table>`;
+  disk: {
+    build() {
+      return `
+        <div class="info-grid">
+          <div class="info-item"><div class="info-label">当前吞吐（读写合计）</div><div class="info-value" id="disk-rate">—</div></div>
+          <div class="info-item"><div class="info-label">IOPS</div><div class="info-value" id="disk-iops">—</div></div>
+          <div class="info-item"><div class="info-label">60 秒峰值</div><div class="info-value" id="disk-peak">—</div></div>
+        </div>
+        <div class="section-title">卷（APFS 容器）</div>
+        <table class="vol-table">
+          <thead><tr><th>卷</th><th>挂载点</th><th>容量</th><th style="text-align:right">可用</th></tr></thead>
+          <tbody id="vol-tbody"><tr><td colspan="4" style="color:var(--text-3)">采集中…</td></tr></tbody>
+        </table>`;
+    },
+    update(d) {
+      setText('disk-rate', fmtRate(d.disk.mbps * 1024 * 1024));
+      setText('disk-iops', d.disk.tps.toFixed(0) + ' 次/秒');
+      setText('disk-peak', fmtRate(Math.max(...hist.disk, 0) * 1024 * 1024));
+      const tb = document.getElementById('vol-tbody');
+      if (tb && d.disk.volumes.length) {
+        tb.innerHTML = d.disk.volumes.map(v => `
+          <tr>
+            <td>${esc(v.name)}</td>
+            <td style="color:var(--text-2)">${esc(v.mount)}</td>
+            <td>${fmtSize(v.used)} / ${fmtSize(v.total)}
+              <span class="usage-track"><span class="usage-fill" style="width:${(v.used / v.total * 100).toFixed(0)}%"></span></span>
+            </td>
+            <td>可用 ${fmtSize(v.avail)}</td>
+          </tr>`).join('');
+      }
+    },
+    meta() { return '读写吞吐合计（macOS 磁盘层不区分读写）'; }
   },
-  batt(d) {
-    const b = d.batt;
-    document.getElementById('detail-meta').textContent = b.charging ? '已接通电源' : '使用电池';
-    drawSeries(document.getElementById('bigchart'), hist.batt, '#30d158', 100);
-    document.getElementById('chart-max').textContent = '100%';
-    return `
-      <div class="info-grid">
-        <div class="info-item"><div class="info-label">电量</div><div class="info-value">${b.present ? b.percent + '%' : '—'}</div></div>
-        <div class="info-item"><div class="info-label">状态</div><div class="info-value">${b.present ? (b.charging ? '⚡ 充电中' : '🔋 电池供电') : '无电池'}</div></div>
-        <div class="info-item"><div class="info-label">${b.charging ? '充满' : '可用'}时间</div><div class="info-value">${b.timeRemaining || '—'}</div></div>
-      </div>
-      <div class="section-title">近 60 秒电量曲线</div>`;
+  net: {
+    build() {
+      return `
+        <div class="info-grid">
+          <div class="info-item"><div class="info-label">接收速率 ↓</div><div class="info-value" style="color:#ffd60a" id="net-rx">—</div></div>
+          <div class="info-item"><div class="info-label">发送速率 ↑</div><div class="info-value" style="color:#ff453a" id="net-tx">—</div></div>
+          <div class="info-item"><div class="info-label">本次开机累计接收</div><div class="info-value" id="net-rxt">—</div></div>
+          <div class="info-item"><div class="info-label">本次开机累计发送</div><div class="info-value" id="net-txt">—</div></div>
+        </div>
+        <div class="section-title">网络接口（<span style="color:#ffd60a">黄=接收</span> / <span style="color:#ff453a">红=发送</span>）</div>
+        <table class="vol-table">
+          <thead><tr><th>接口</th><th>接收</th><th>发送</th><th>累计</th></tr></thead>
+          <tbody id="net-tbody"></tbody>
+        </table>`;
+    },
+    update(d) {
+      const en0 = d.net.ifaces.find(i => i.name === 'en0') || d.net.ifaces[0] ||
+        { rxRate: 0, txRate: 0, ibytes: 0, obytes: 0, name: 'en0' };
+      setText('net-rx', fmtRate(en0.rxRate));
+      setText('net-tx', fmtRate(en0.txRate));
+      setText('net-rxt', fmtSize(en0.ibytes));
+      setText('net-txt', fmtSize(en0.obytes));
+      const tb = document.getElementById('net-tbody');
+      if (tb) tb.innerHTML = d.net.ifaces.map(i => `
+        <tr>
+          <td>${esc(i.name)}${i.name === 'en0' ? ' <span style="color:var(--text-3)">（Wi-Fi）</span>' : ''}</td>
+          <td style="color:#ffd60a">↓ ${fmtRate(i.rxRate)}</td>
+          <td style="color:#ff453a">↑ ${fmtRate(i.txRate)}</td>
+          <td>累计收 ${fmtSize(i.ibytes)} / 发 ${fmtSize(i.obytes)}</td>
+        </tr>`).join('');
+    },
+    meta(d) { return d.wifi ? `Wi-Fi · ${d.wifi}` : '网络接口'; }
+  },
+  batt: {
+    build() {
+      return `
+        <div class="info-grid">
+          <div class="info-item"><div class="info-label">电量</div><div class="info-value" id="batt-pct">—</div></div>
+          <div class="info-item"><div class="info-label">状态</div><div class="info-value" id="batt-state">—</div></div>
+          <div class="info-item"><div class="info-label"><span id="batt-time-label">可用</span>时间</div><div class="info-value" id="batt-time">—</div></div>
+        </div>
+        <div class="section-title">近 60 秒电量曲线</div>`;
+    },
+    update(d) {
+      const b = d.batt;
+      setText('batt-pct', b.present ? b.percent + '%' : '—');
+      setText('batt-state', b.present ? (b.charging ? '⚡ 充电中' : '🔋 电池供电') : '无电池');
+      setText('batt-time', b.timeRemaining || '—');
+      setText('batt-time-label', b.charging ? '充满' : '可用');
+    },
+    meta(d) { return d.batt.charging ? '已接通电源' : '使用电池'; }
   }
 };
 
-// CPU 详情渲染后需要补画 P/E 面板和每核小图
-function paintCpuExtras(d) {
-  if (activeCard !== 'cpu' || !d) return;
-  const pCv = document.getElementById('pe-p');
-  const eCv = document.getElementById('pe-e');
-  if (pCv) drawSeries(pCv, hist.cpuP, '#0a84ff', 100);
-  if (eCv) drawSeries(eCv, hist.cpuE, '#30d158', 100);
-  d.cpu.coreLoads.forEach((v, i) => {
-    if (!hist.cores[i]) hist.cores[i] = [];
-    const cv = document.getElementById('tile-cv-' + i);
-    if (!cv) return;
-    const st = d.staticInfo;
-    drawSeries(cv, hist.cores[i], st.coreTypes[i] === 'P' ? '#0a84ff' : '#30d158', 100);
-    const tv = document.getElementById('tile-val-' + i);
-    if (tv) tv.textContent = v.toFixed(0) + '%';
-  });
-}
-
-function renderDetail() {
+function tickDetail(force) {
   if (!latest) return;
-  document.getElementById('detail-title').textContent = titleMap[activeCard];
-  document.getElementById('detail-body').innerHTML = detailRenderers[activeCard](latest);
-  paintCpuExtras(latest);
+  const body = document.getElementById('detail-body');
+  if (!bodyBuilt || force) {
+    body.innerHTML = detailDefs[activeCard].build(latest);
+    bodyBuilt = true;
+  }
+  detailDefs[activeCard].update(latest);
+  // 大图 + 轴标注
+  const color = cardColor[activeCard];
+  const big = document.getElementById('bigchart');
+  if (activeCard === 'net') {
+    drawOverlaid(big, hist.netrx, hist.nettx, '#ffd60a', '#ff453a');
+    setText('chart-max', fmtRate(Math.max(...hist.netrx, ...hist.nettx, 0.001)));
+  } else {
+    const series = { cpu: hist.cpu, mem: hist.mem, gpu: hist.gpu, disk: hist.disk, batt: hist.batt };
+    const yMax = (activeCard === 'mem' || activeCard === 'gpu' || activeCard === 'batt') ? 100 : undefined;
+    drawSeries(big, series[activeCard], color, yMax);
+    setText('chart-max', activeCard === 'batt' ? '100%'
+      : activeCard === 'disk' ? fmtRate(Math.max(...hist.disk, 0.0001) * 1024 * 1024)
+      : (activeCard === 'mem' || activeCard === 'gpu') ? '100%' : '');
+  }
+  setText('detail-meta', detailDefs[activeCard].meta(latest));
 }
 
 // ---------- 进程 ----------
@@ -345,8 +401,8 @@ function switchView(v) {
   document.querySelectorAll('.tab').forEach(x => x.classList.toggle('active', x.dataset.view === v));
   document.getElementById('perf-view').classList.toggle('active', v === 'perf');
   document.getElementById('procs-view').classList.toggle('active', v === 'procs');
+  if (v === 'perf' && latest) tickDetail(true);
   if (v === 'procs' && latest) renderProcs(latest);
-  if (v === 'perf' && latest) { renderDetail(); }
 }
 document.querySelectorAll('.tab').forEach(t => { t.onclick = () => switchView(t.dataset.view); });
 document.getElementById('proc-search').addEventListener('input', e => {
@@ -357,7 +413,6 @@ document.getElementById('th-cpu').onclick = () => {
   procSort = procSort === 'cpu' ? 'pid' : procSort === 'pid' ? 'mem' : 'cpu';
   if (latest) renderProcs(latest);
 };
-// 键盘：⌘1/⌘2 切页，Esc 清空搜索
 window.addEventListener('keydown', e => {
   if (e.metaKey && e.key === '1') { e.preventDefault(); switchView('perf'); }
   else if (e.metaKey && e.key === '2') { e.preventDefault(); switchView('procs'); }
@@ -365,13 +420,9 @@ window.addEventListener('keydown', e => {
     const s = document.getElementById('proc-search');
     if (s.value) { s.value = ''; procQuery = ''; if (latest) renderProcs(latest); }
   }
+  document.body.classList.toggle('cmd-down', e.metaKey);
 });
-window.addEventListener('keydown', e => {
-  if (e.metaKey) document.body.classList.add('cmd-down');
-});
-window.addEventListener('keyup', e => {
-  if (!e.metaKey) document.body.classList.remove('cmd-down');
-});
+window.addEventListener('keyup', e => { if (!e.metaKey) document.body.classList.remove('cmd-down'); });
 
 // ---------- 主循环 ----------
 window.bridge.onStats((d) => {
@@ -380,6 +431,7 @@ window.bridge.onStats((d) => {
   push(hist.cpuP, d.cpu.pUsage === null ? 0 : d.cpu.pUsage);
   push(hist.cpuE, d.cpu.eUsage === null ? 0 : d.cpu.eUsage);
   push(hist.mem, d.mem.used / d.mem.total * 100);
+  push(hist.gpu, d.gpu.util === null ? 0 : d.gpu.util);
   push(hist.disk, d.disk.mbps);
   const en0 = d.net.ifaces.find(i => i.name === 'en0') || d.net.ifaces[0];
   push(hist.netrx, en0 ? en0.rxRate : 0);
@@ -396,10 +448,8 @@ window.bridge.onStats((d) => {
       `macOS ${d.staticInfo.osVersion} · ${d.staticInfo.chip}（${d.staticInfo.perfCount}P + ${d.staticInfo.effCount}E）· 采样间隔 2 秒`;
   }
   updateSidebar(d);
-  renderDetail();
-  if (document.getElementById('procs-view').classList.contains('active')) {
-    renderProcs(d);
-  }
+  if (document.getElementById('perf-view').classList.contains('active')) tickDetail();
+  if (document.getElementById('procs-view').classList.contains('active')) renderProcs(d);
   const up = Math.max(0, Date.now() / 1000 - d.staticInfo.bootSec);
   document.getElementById('sb-right').textContent = `进程 ${d.procs.count} · 已运行 ${fmtUptime(up)}`;
 });

@@ -242,6 +242,21 @@ async function gatherBattery() {
   };
 }
 
+async function gatherGPU() {
+  // IOAccelerator 注册表：GPU 利用率 / 显存（用户态可读，无需 sudo）
+  const out = await run('ioreg -r -d 1 -w 0 -c IOAccelerator 2>/dev/null | grep -E "Device Utilization|Renderer Utilization|Tiler Utilization|In use system memory\\\"" ', 5000);
+  const get = (k) => {
+    const m = out.match(new RegExp('"' + k + '"\\s*=\\s*([\\d.]+)'));
+    return m ? parseFloat(m[1]) : null;
+  };
+  return {
+    util: get('Device Utilization %'),
+    renderer: get('Renderer Utilization %'),
+    tiler: get('Tiler Utilization %'),
+    memBytes: get('In use system memory') // 字节
+  };
+}
+
 async function gatherProcs() {
   // 两次采样由外部轮询控制，这里取瞬时（系统级瞬时 CPU 用 time 差分）
   const out = await run('ps -axo pid=,comm=', 8000);
@@ -288,20 +303,35 @@ async function gatherProcs() {
   return { count: procs.length, list: procs.slice(0, 300) };
 }
 
-// ---------- 轮询 ----------
+// ---------- 轮询（分层：快车道 2s / 慢车道 6s / 低频 30s） ----------
+let tick = 0;
+let lastVolumes = [];
+let lastWifi = '';
+let lastBatt = { present: false };
+let lastProcs = { count: 0, list: [] };
+
 async function poll() {
   if (!win || win.isDestroyed()) return;
   try {
-    const [cpu, mem, diskIO, volumes, net, wifi, batt, procs] = await Promise.all([
-      gatherCPU(), gatherMem(staticInfo), gatherDiskIO(), gatherVolumes(),
-      gatherNet(), gatherWifi(), gatherBattery(), gatherProcs()
+    tick++;
+    // 快车道：每 2 秒
+    const [cpu, mem, diskIO, net, gpu] = await Promise.all([
+      gatherCPU(), gatherMem(staticInfo), gatherDiskIO(), gatherNet(), gatherGPU()
     ]);
+    // 低频：每 30 秒（变化很慢的指标）
+    if (tick === 1 || tick % 15 === 0) {
+      [lastBatt, lastWifi] = await Promise.all([gatherBattery(), gatherWifi()]);
+    }
+    // 慢车道：每 6 秒
+    if (tick === 1 || tick % 3 === 2) lastVolumes = await gatherVolumes();
+    if (tick === 2 || tick % 3 === 0) lastProcs = await gatherProcs();
+
     win.webContents.send('stats', {
       ts: Date.now(),
       cpu, mem,
-      disk: { ...diskIO, volumes },
-      net, wifi, batt, procs,
-      staticInfo
+      disk: { ...diskIO, volumes: lastVolumes },
+      net, wifi: lastWifi, batt: lastBatt, procs: lastProcs,
+      gpu, staticInfo
     });
   } catch (e) {
     console.error('poll error', e);
@@ -327,6 +357,15 @@ app.whenReady().then(async () => {
     return new Promise((resolve) => {
       exec(`kill -9 ${pid}`, (err) => resolve(err ? '失败：' + err.message : `已退出进程 ${pid}`));
     });
+  });
+  // GPU 静态信息（system_profiler 较慢，仅启动时取一次，不阻塞窗口）
+  run('system_profiler SPDisplaysDataType 2>/dev/null', 15000).then(out => {
+    const cores = (out.match(/Total Number of Cores:\s*(\d+)/) || [])[1];
+    const metal = (out.match(/Metal Support:\s*(.+)/) || [])[1];
+    staticInfo.gpu = {
+      cores: cores ? parseInt(cores, 10) : null,
+      metal: metal ? metal.trim() : null
+    };
   });
   // 首轮预热采样，之后每 2 秒推送
   setTimeout(poll, 800);
