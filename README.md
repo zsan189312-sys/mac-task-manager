@@ -2,6 +2,16 @@
 
 为 Apple Silicon Mac 打造的 Electron 任务管理器，模仿 Windows 11 任务管理器的布局逻辑，采用 macOS 原生视觉（毛玻璃 vibrancy / SF Pro / hairline）。
 
+## 预览
+
+**性能页** — CPU 总览 + 性能/能效核心分离 + 每核实时小图块 + 估算频率：
+
+![性能页](docs/screenshots/performance.png)
+
+**进程页** — 800 进程实时 CPU 差分排序、搜索、一键强制退出：
+
+![进程页](docs/screenshots/processes.png)
+
 ## 特性
 
 - **性能核心 / 能效核心分离**：自动识别 P/E 核心数量（如 M4 = 4P + 6E），双面板独立曲线 + 每核实时小图块

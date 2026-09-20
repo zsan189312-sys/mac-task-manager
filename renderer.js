@@ -104,7 +104,7 @@ function updateSidebar(d) {
   const vol = (d.disk.volumes.find(v => v.mount === '/') || d.disk.volumes[0]) || {};
   setText('sub-disk', `${fmtSize(vol.used)} / ${fmtSize(vol.total)} · ${fmtRate(d.disk.mbps * 1024 * 1024)}`);
   const en0 = d.net.ifaces.find(i => i.name === 'en0') || d.net.ifaces[0];
-  setText('sub-net', d.wifi ? `Wi-Fi · ${d.wifi}` : (en0 ? en0.name : '未连接'));
+  setText('sub-net', d.wifi ? `Wi-Fi · ${d.wifi}` : (en0 ? 'Wi-Fi · 已连接' : '未连接'));
   setText('sub-batt', d.batt.present ? `${d.batt.percent}%${d.batt.charging ? ' · 充电中' : ''}` : '无电池');
   setText('sub-gpu', d.gpu.util === null ? '—' : `${d.gpu.util.toFixed(0)}% · ${fmtSize(d.gpu.memBytes)}`);
 
@@ -326,7 +326,7 @@ const detailDefs = {
           <td>累计收 ${fmtSize(i.ibytes)} / 发 ${fmtSize(i.obytes)}</td>
         </tr>`).join('');
     },
-    meta(d) { return d.wifi ? `Wi-Fi · ${d.wifi}` : '网络接口'; }
+    meta(d) { return d.wifi ? `Wi-Fi · ${d.wifi}` : 'Wi-Fi · 已连接'; }
   },
   batt: {
     build() {

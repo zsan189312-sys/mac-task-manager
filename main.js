@@ -25,6 +25,14 @@ function createWindow() {
     }
   });
   win.loadFile('index.html');
+  // 支持 --view=procs 启动参数，或标记文件强制指定初始页签
+  const forceProcs = process.argv.some(a => a === '--view=procs') ||
+    (() => { try { return require('fs').existsSync('/tmp/tm_force_procs'); } catch { return false; } })();
+  if (forceProcs) {
+    win.webContents.on('did-finish-load', () => {
+      win.webContents.executeJavaScript("try{switchView('procs')}catch(e){}").catch(() => {});
+    });
+  }
   // win.webContents.openDevTools({ mode: 'detach' });
 }
 
@@ -226,7 +234,10 @@ async function gatherNet() {
 
 async function gatherWifi() {
   const out = await run("ipconfig getsummary en0 2>/dev/null | awk -F ' : ' '/ SSID/{print $2; exit}'");
-  return out.trim();
+  const ssid = out.trim();
+  // macOS 隐私接口可能返回 <redacted>，此时不显示 SSID
+  if (!ssid || /redacted/i.test(ssid)) return '';
+  return ssid;
 }
 
 async function gatherBattery() {
