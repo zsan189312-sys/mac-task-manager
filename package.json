@@ -1,0 +1,13 @@
+{
+  "name": "mac-task-manager",
+  "productName": "任务管理器",
+  "version": "2.0.0",
+  "description": "Mac 任务管理器 - 贴合 Apple Silicon 的本机性能监测",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "dependencies": {
+    "electron": "^37.10.3"
+  }
+}

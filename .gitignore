@@ -1,0 +1,5 @@
+node_modules/
+.electron-cache/
+bin/cpucores
+*.log
+.DS_Store
