@@ -7,12 +7,14 @@ const hist = {
 
 const cards = [
   { id: 'cpu',  title: 'CPU',  color: '#0a84ff' },
-  { id: 'mem',  title: '内存', color: '#bf5af2' },
   { id: 'gpu',  title: 'GPU',  color: '#64d2ff' },
+  { id: 'mem',  title: '内存', color: '#bf5af2' },
   { id: 'disk', title: '磁盘', color: '#30d158' },
   { id: 'net',  title: 'Wi-Fi', color: '#ffd60a' },
   { id: 'batt', title: '电池', color: '#30d158' }
 ];
+// M4 核心频率规格（Apple 公布 P 核睿频 4.41 GHz；E 核实测约 2.6 GHz）
+const FREQ = { pIdle: 0.7, pMax: 4.41, eIdle: 0.6, eMax: 2.6 };
 const cardColor = Object.fromEntries(cards.map(c => [c.id, c.color]));
 let activeCard = 'cpu';
 let latest = null;
@@ -170,6 +172,8 @@ const detailDefs = {
       html += `</div>
         <div class="info-grid">
           <div class="info-item"><div class="info-label">总利用率</div><div class="info-value" id="cpu-total">—</div></div>
+          <div class="info-item"><div class="info-label">P 核估算频率</div><div class="info-value" style="color:var(--p-core)" id="cpu-freq-p">—</div></div>
+          <div class="info-item"><div class="info-label">E 核估算频率</div><div class="info-value" style="color:var(--e-core)" id="cpu-freq-e">—</div></div>
           <div class="info-item"><div class="info-label">用户 / 系统</div><div class="info-value" id="cpu-us">—</div></div>
           <div class="info-item"><div class="info-label">空闲</div><div class="info-value" id="cpu-idle">—</div></div>
           <div class="info-item"><div class="info-label">负载均值 (1/5/15 分钟)</div><div class="info-value" id="cpu-load">—</div></div>
@@ -187,12 +191,17 @@ const detailDefs = {
         if (cv) drawSeries(cv, hist.cores[i], d.staticInfo.coreTypes[i] === 'P' ? '#0a84ff' : '#30d158', 100);
       });
       setText('cpu-total', d.cpu.usage.toFixed(1) + '%');
+      // 估算频率：闲置基频 + 利用率 × 睿频区间（macOS 无用户态频率接口）
+      const fp = d.cpu.pUsage === null ? null : FREQ.pIdle + (FREQ.pMax - FREQ.pIdle) * (d.cpu.pUsage / 100);
+      const fe = d.cpu.eUsage === null ? null : FREQ.eIdle + (FREQ.eMax - FREQ.eIdle) * (d.cpu.eUsage / 100);
+      setText('cpu-freq-p', fp === null ? '—' : '~' + fp.toFixed(2) + ' GHz');
+      setText('cpu-freq-e', fe === null ? '—' : '~' + fe.toFixed(2) + ' GHz');
       setText('cpu-us', `${d.cpu.user.toFixed(1)}% / ${d.cpu.sys.toFixed(1)}%`);
       setText('cpu-idle', d.cpu.idle.toFixed(1) + '%');
       const la = d.cpu.loadAvg;
       setText('cpu-load', `${(la[0]||0).toFixed(2)} / ${(la[1]||0).toFixed(2)} / ${(la[2]||0).toFixed(2)}`);
     },
-    meta(d) { return `${d.staticInfo.chip} · ${d.staticInfo.perfCount} 性能核 + ${d.staticInfo.effCount} 能效核`; }
+    meta(d) { return `${d.staticInfo.chip} · P 核睿频 4.41 GHz · E 核 ~2.6 GHz（频率为利用率估算）`; }
   },
   gpu: {
     build(d) {

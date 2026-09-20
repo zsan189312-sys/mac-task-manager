@@ -109,8 +109,8 @@
   .panel-value { font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; }
   .panel canvas { width: 100%; height: 84px; display: block; }
 
-  /* 每核小图块（Windows 任务管理器式） */
-  .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); gap: 8px; }
+  /* 每核小图块（Windows 任务管理器式）——固定 5 列，10 核恰好铺满不留白 */
+  .tiles { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; }
   .tile {
     background: var(--surface); border: 1px solid var(--hairline); border-radius: var(--r-sm);
     padding: 8px 10px 6px;
