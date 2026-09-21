@@ -405,7 +405,7 @@ function renderProcs(d) {
       <td class="td-num">${fmtSize(p.rss)}</td>
       <td class="td-num"><span class="io-detail">${ioTxt}</span></td>
       <td class="td-num">${netTxt}</td>
-      <td class="td-num">${p.energy.toFixed(1)}</td>
+      <td class="td-num">${p.energy > 0 ? p.energy.toFixed(1) + ' W' : '<span style="opacity:.35">—</span>'}</td>
       ${killTd}
     </tr>`;
   }).join('');

@@ -358,12 +358,15 @@ async function gatherProcs() {
       cpu = Math.max(0, (c.cpuNs - prev.cpuNs) / 1e9 / iv * 100);
       diskRead = Math.max(0, (c.dR - prev.dR) / iv);
       diskWrite = Math.max(0, (c.dW - prev.dW) / iv);
-      const wkRate = Math.max(0, (c.wk - prev.wk) / iv);
-      energy = cpu + wkRate * 0.5; // 能耗影响估算：CPU 占用 + 每秒唤醒数
     }
     const psVal = psCpu[pid] || 0;
-    if (psVal > cpu) { cpu = psVal; energy = Math.max(energy, cpu); }
-    attrFrac += cpu / 100 / ncpu;
+    if (psVal > cpu) { cpu = psVal; }
+    // 换算为"占整机容量百分比"（单核口径 ÷ 核数），最大 100
+    cpu = Math.min(100, cpu / ncpu);
+    // 能耗瓦数估算：整机份额 × 20W（M4 全核满载 CPU 功耗约 20W）+ 唤醒率开销
+    const wkRate = prev ? Math.max(0, (c.wk - prev.wk) / iv) : 0;
+    energy = (cpu / 100) * 20 + wkRate * 0.05;
+    attrFrac += cpu / 100;
     if (nPrev) {
       rx = Math.max(0, (nPrev.rx - (prev ? (prev.rx0 || 0) : 0)) / iv);
       tx = Math.max(0, (nPrev.tx - (prev ? (prev.tx0 || 0) : 0)) / iv);
@@ -378,10 +381,10 @@ async function gatherProcs() {
   //    使进程页 CPU 合计 ≈ 性能页总利用率。
   const realCount = procs.length;
   if (lastHostFrac && lastProcRaw) {
-    const kernelPct = Math.max(0, lastHostFrac.sys) * ncpu * 100;
-    const protPct = Math.max(0, lastHostFrac.user - attrFrac) * ncpu * 100;
-    procs.push({ pid: 0, name: 'kernel_task（内核）', cpu: kernelPct, rss: 0, diskRead: 0, diskWrite: 0, rx: 0, tx: 0, energy: 0, pseudo: true });
-    procs.push({ pid: -1, name: '系统进程（受保护·聚合估算）', cpu: protPct, rss: 0, diskRead: 0, diskWrite: 0, rx: 0, tx: 0, energy: 0, pseudo: true });
+    const kernelPct = Math.max(0, lastHostFrac.sys) * 100;               // 占整机 %
+    const protPct = Math.max(0, lastHostFrac.user - attrFrac) * 100;     // 占整机 %
+    procs.push({ pid: 0, name: 'kernel_task（内核）', cpu: kernelPct, rss: 0, diskRead: 0, diskWrite: 0, rx: 0, tx: 0, energy: kernelPct / 100 * 20, pseudo: true });
+    procs.push({ pid: -1, name: '系统进程（受保护·聚合估算）', cpu: protPct, rss: 0, diskRead: 0, diskWrite: 0, rx: 0, tx: 0, energy: protPct / 100 * 20, pseudo: true });
   }
   procs.sort((a, b) => b.cpu - a.cpu);
 
