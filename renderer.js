@@ -11,7 +11,7 @@ const cards = [
   { id: 'mem',  title: '内存', color: '#bf5af2' },
   { id: 'disk', title: '磁盘', color: '#30d158' },
   { id: 'net',  title: 'Wi-Fi', color: '#ffd60a' },
-  { id: 'batt', title: '电池', color: '#30d158' }
+  { id: 'batt', title: '电池', color: '#ff9f0a' }
 ];
 // M4 核心频率规格（Apple 公布 P 核睿频 4.41 GHz；E 核实测约 2.6 GHz）
 const FREQ = { pIdle: 0.7, pMax: 4.41, eIdle: 0.6, eMax: 2.6 };
@@ -114,7 +114,7 @@ function updateSidebar(d) {
   drawSeries(document.getElementById('spark-disk'), hist.disk, '#30d158');
   drawSeries(document.getElementById('spark-net'), hist.netrx, '#ffd60a');
   drawSeries(document.getElementById('spark-net'), hist.nettx, '#ff453a');
-  drawSeries(document.getElementById('spark-batt'), hist.batt, '#30d158', 100);
+  drawSeries(document.getElementById('spark-batt'), hist.batt, '#ff9f0a', 100);
 }
 
 // ---------- 详情：build（切换时一次） / update（每帧增量） ----------
