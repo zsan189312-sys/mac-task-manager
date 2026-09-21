@@ -27,12 +27,19 @@ function createWindow() {
     }
   });
   win.loadFile('index.html');
-  // 支持 --view=procs 启动参数，或标记文件强制指定初始页签
-  const forceProcs = process.argv.some(a => a === '--view=procs') ||
-    (() => { try { return require('fs').existsSync('/tmp/tm_force_procs'); } catch { return false; } })();
-  if (forceProcs) {
+  // 支持 --view=<页签> 启动参数，或 /tmp/tm_view 文件指定初始页签，或 /tmp/tm_force_procs 强制进程页
+  const argView = (process.argv.find(a => a.startsWith('--view=')) || '').slice(7);
+  let fileView = '';
+  try { fileView = require('fs').readFileSync('/tmp/tm_view', 'utf8').trim(); } catch { }
+  const forceProcs = (() => { try { return require('fs').existsSync('/tmp/tm_force_procs'); } catch { return false; } })();
+  const initView = ['cpu', 'gpu', 'mem', 'disk', 'net', 'batt', 'procs'].includes(fileView) ? fileView
+    : (forceProcs ? 'procs' : argView);
+  if (initView) {
     win.webContents.on('did-finish-load', () => {
-      win.webContents.executeJavaScript("try{switchView('procs')}catch(e){}").catch(() => {});
+      const js = initView === 'procs'
+        ? "try{switchView('procs')}catch(e){}"
+        : `try{selectCard('${initView}')}catch(e){}`;
+      win.webContents.executeJavaScript(js).catch(() => {});
     });
   }
   // win.webContents.openDevTools({ mode: 'detach' });
@@ -83,7 +90,6 @@ async function getStatic() {
 const CPU_HELPER = path.join(__dirname, 'bin', 'cpucores');
 let lastCoreTicks = null;     // 每核 [user, system, idle, nice]
 let lastIfaces = null;        // { name: {ibytes, obytes} }
-let lastProcCpu = null;       // { pid: cpuSeconds }
 
 async function gatherCPU() {
   // 优先走 Mach API（Swift 助手，macOS 27 移除了 kern.cp_time/cp_times）
@@ -270,28 +276,119 @@ async function gatherGPU() {
   };
 }
 
+const PROCINFO = path.join(__dirname, 'bin', 'procinfo');
+let lastProcRaw = null;       // { pid: {ticks,dR,dW,wk} }
+let lastProcsTime = 0;        // 上次进程采集时间戳(ms)
+let lastProcCpu = null;       // ps 兜底方案用 { pid: cpuSeconds }
+let liveNet = {};             // nettop 常驻流的每进程累计字节 { pid: {rx,tx} }
+let netStreamChild = null;
+
+// nettop 常驻流：每秒输出一次每进程累计字节，开销为零（避免每次轮询 spawn 5 秒采样）
+function startNetStream() {
+  try {
+    netStreamChild = exec('nettop -P -x -l 0', { maxBuffer: 128 * 1024 * 1024 }, () => {});
+    let buf = '';
+    netStreamChild.stdout.setEncoding('utf8');
+    netStreamChild.stdout.on('data', (chunk) => {
+      buf += chunk;
+      let idx;
+      while ((idx = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, idx);
+        buf = buf.slice(idx + 1);
+        const t = line.trim().split(/\s+/);
+        if (t.length < 4 || !t[1] || !t[1].includes('.')) continue;
+        const pid = t[1].slice(t[1].lastIndexOf('.') + 1);
+        if (!/^\d+$/.test(pid)) continue;
+        if (!liveNet[pid]) liveNet[pid] = { rx: 0, tx: 0 };
+        liveNet[pid].rx = parseInt(t[2], 10) || 0;
+        liveNet[pid].tx = parseInt(t[3], 10) || 0;
+      }
+    });
+    netStreamChild.on('exit', () => { setTimeout(startNetStream, 5000); }); // 断流自动重启
+  } catch (e) { /* 忽略，网速列显示 — */ }
+}
+
 async function gatherProcs() {
-  // 两次采样由外部轮询控制，这里取瞬时（系统级瞬时 CPU 用 time 差分）
+  const now = Date.now();
+  const elapsed = lastProcsTime > 0 ? (now - lastProcsTime) / 1000 : 0;
+  const iv = elapsed > 0.5 ? elapsed : 2;
+
+  // 1) procinfo 助手：KERN_PROC_ALL 全量枚举（含 root 系统进程）
+  //    行格式：pid \t cpticks \t diskR \t diskW \t wakeups \t rss \t path
+  const out = await run('"' + PROCINFO + '"', 8000);
+  const cur = {};
+  const lines = out.trim().split('\n').filter(Boolean);
+  lines.forEach(line => {
+    const p = line.split('\t');
+    if (p.length < 7) return;
+    cur[p[0]] = { cpuNs: +p[1], dR: +p[2], dW: +p[3], wk: +p[4], rss: +p[5], path: p[6] || '' };
+  });
+
+  // 兜底：procinfo 被阻断时回退旧 ps 方案
+  if (lines.length < 30) {
+    return await gatherProcsPsFallback(iv, now);
+  }
+
+  // 2) 差分合成进程列表（网速来自常驻 nettop 流的累计字节差分）
+  const procs = [];
+  for (const [pid, c] of Object.entries(cur)) {
+    const prev = lastProcRaw ? lastProcRaw[pid] : null;
+    const nPrev = liveNet[pid];
+    let cpu = 0, diskRead = 0, diskWrite = 0, energy = 0, rx = 0, tx = 0;
+    if (prev) {
+      // CPU 时间为纳秒累计：Δns / Δt(ns) × 100 = 占用单核百分比（与 top 口径一致）
+      cpu = Math.max(0, (c.cpuNs - prev.cpuNs) / 1e9 / iv * 100);
+      diskRead = Math.max(0, (c.dR - prev.dR) / iv);
+      diskWrite = Math.max(0, (c.dW - prev.dW) / iv);
+      const wkRate = Math.max(0, (c.wk - prev.wk) / iv);
+      energy = cpu + wkRate * 0.5; // 能耗影响估算：CPU 占用 + 每秒唤醒数
+    }
+    if (nPrev) {
+      rx = Math.max(0, (nPrev.rx - (prev ? (prev.rx0 || 0) : 0)) / iv);
+      tx = Math.max(0, (nPrev.tx - (prev ? (prev.tx0 || 0) : 0)) / iv);
+    }
+    const full = c.path || '';
+    const name = full.includes('/') ? full.slice(full.lastIndexOf('/') + 1) : (full || '(未知)');
+    procs.push({ pid: parseInt(pid, 10), name, cpu, rss: c.rss, diskRead, diskWrite, rx, tx, energy });
+  }
+  procs.sort((a, b) => b.cpu - a.cpu);
+
+  // 记录本轮 net 快照，供下轮差分
+  const rawWithNet = {};
+  for (const [pid, c] of Object.entries(cur)) {
+    rawWithNet[pid] = { ...c, rx0: liveNet[pid] ? liveNet[pid].rx : 0, tx0: liveNet[pid] ? liveNet[pid].tx : 0 };
+  }
+  lastProcRaw = rawWithNet;
+  lastProcsTime = now;
+  return { count: procs.length, list: procs.slice(0, 300) };
+}
+
+// 旧方案兜底（procinfo 被系统策略阻断时）
+async function gatherProcsPsFallback(iv, now) {
   const out = await run('ps -axo pid=,comm=', 8000);
   const timeOut = await run('ps -axo pid=,time=', 8000);
   const names = {};
   out.trim().split('\n').forEach(line => {
-    const m = line.trim().match(/^(\d+)\s+(.+)$/);   // ps 输出 PID 右对齐有前导空格，必须 trim
+    const m = line.trim().match(/^(\d+)\s+(.+)$/);
     if (m) names[m[1]] = m[2].trim();
   });
   const cur = {};
   timeOut.trim().split('\n').forEach(line => {
-    // ps -o time 格式: "0:15.32" / "12:03.10" / "1:02:03.44" / "3-04:05:06.7"
     const m = line.trim().match(/^\s*(\d+)\s+(?:(\d+)-)?([\d:.]+)$/);
     if (m) {
-      const pid = m[1];
       const days = m[2] ? parseInt(m[2], 10) * 86400 : 0;
       const parts = m[3].split(':').map(parseFloat);
       let secs = days;
       if (parts.length === 3) secs += parts[0] * 3600 + parts[1] * 60 + parts[2];
       else if (parts.length === 2) secs += parts[0] * 60 + parts[1];
-      cur[pid] = secs;
+      cur[m[1]] = secs;
     }
+  });
+  const memOut = await run('ps -axo pid=,rss=', 8000);
+  const rssMap = {};
+  memOut.trim().split('\n').forEach(line => {
+    const m = line.trim().match(/^(\d+)\s+(\d+)$/);
+    if (m) rssMap[m[1]] = parseInt(m[2], 10) * KB;
   });
   const procs = [];
   for (const [pid, secs] of Object.entries(cur)) {
@@ -299,20 +396,13 @@ async function gatherProcs() {
     const name = full.includes('/') ? full.slice(full.lastIndexOf('/') + 1) : full;
     let cpu = 0;
     if (lastProcCpu && lastProcCpu[pid] !== undefined) {
-      cpu = Math.max(0, (secs - lastProcCpu[pid]) / 2 * 100);
+      cpu = Math.max(0, (secs - lastProcCpu[pid]) / iv * 100);
     }
-    procs.push({ pid: parseInt(pid, 10), name, cpu });
+    procs.push({ pid: parseInt(pid, 10), name, cpu, rss: rssMap[pid] || 0, diskRead: 0, diskWrite: 0, rx: 0, tx: 0, energy: cpu });
   }
-  lastProcCpu = cur;
   procs.sort((a, b) => b.cpu - a.cpu);
-  // 内存另取一轮（快）
-  const memOut = await run('ps -axo pid=,rss=', 8000);
-  const rssMap = {};
-  memOut.trim().split('\n').forEach(line => {
-    const m = line.trim().match(/^(\d+)\s+(\d+)$/);
-    if (m) rssMap[m[1]] = parseInt(m[2], 10) * KB;
-  });
-  procs.forEach(p => { p.rss = rssMap[String(p.pid)] || 0; });
+  lastProcCpu = cur;
+  lastProcsTime = now;
   return { count: procs.length, list: procs.slice(0, 300) };
 }
 
@@ -381,6 +471,7 @@ app.whenReady().then(async () => {
     };
   });
   // 首轮预热采样，之后每 2 秒推送
+  startNetStream(); // 常驻 nettop 流：每进程网络累计字节
   setTimeout(poll, 800);
   timer = setInterval(poll, 2000);
 });

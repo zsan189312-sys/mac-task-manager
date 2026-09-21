@@ -357,6 +357,7 @@ function tickDetail(force) {
     bodyBuilt = true;
   }
   detailDefs[activeCard].update(latest);
+  setText('detail-title', titleMap[activeCard]); // 标题跟随当前卡片（修复 GPU 页标题残留 CPU）
   // 大图 + 轴标注
   const color = cardColor[activeCard];
   const big = document.getElementById('bigchart');
@@ -375,27 +376,41 @@ function tickDetail(force) {
 }
 
 // ---------- 进程 ----------
+const procSortLabels = { cpu: 'CPU', mem: '内存', disk: '磁盘', net: '网速', energy: '能耗', pid: 'PID' };
 function renderProcs(d) {
   const tbody = document.getElementById('proc-tbody');
   const q = procQuery.toLowerCase();
   let list = d.procs.list;
   if (q) list = list.filter(p => p.name.toLowerCase().includes(q) || String(p.pid).includes(q));
-  if (procSort === 'cpu') list = [...list].sort((a, b) => b.cpu - a.cpu);
-  else if (procSort === 'mem') list = [...list].sort((a, b) => b.rss - a.rss);
-  else if (procSort === 'pid') list = [...list].sort((a, b) => a.pid - b.pid);
+  const key = procSort;
+  const metric = (p) => key === 'cpu' ? p.cpu : key === 'mem' ? p.rss : key === 'disk' ? p.diskRead + p.diskWrite : key === 'net' ? p.rx + p.tx : key === 'energy' ? p.energy : p.pid;
+  if (key === 'pid') list = [...list].sort((a, b) => a.pid - b.pid);
+  else list = [...list].sort((a, b) => metric(b) - metric(a));
   const shown = list.slice(0, 200);
-  tbody.innerHTML = shown.map(p => `
+  tbody.innerHTML = shown.map(p => {
+    const dTotal = p.diskRead + p.diskWrite;
+    const ioTxt = dTotal > 0 ? `R ${fmtRate(p.diskRead)} / W ${fmtRate(p.diskWrite)}` : '<span style="opacity:.35">—</span>';
+    const netTxt = (p.rx + p.tx) > 0 ? `<span style="color:#ffd60a">↓ ${fmtRate(p.rx)}</span> <span style="color:#ff453a">↑ ${fmtRate(p.tx)}</span>` : '<span style="opacity:.35">—</span>';
+    return `
     <tr>
-      <td class="td-num">${p.pid}</td>
+      <td class="td-num" style="color:var(--text-3)">${p.pid}</td>
       <td style="max-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(p.name)}</td>
       <td class="td-num ${p.cpu > 30 ? 'cpu-hot' : ''}">${p.cpu.toFixed(1)}</td>
       <td class="td-num">${fmtSize(p.rss)}</td>
+      <td class="td-num"><span class="io-detail">${ioTxt}</span></td>
+      <td class="td-num">${netTxt}</td>
+      <td class="td-num">${p.energy.toFixed(1)}</td>
       <td style="text-align:right"><button class="kill-btn" data-pid="${p.pid}">退出</button></td>
-    </tr>`).join('');
+    </tr>`;
+  }).join('');
   document.getElementById('proc-summary').textContent =
-    `显示 ${shown.length} / ${d.procs.count} 个进程 · 按 ${procSort === 'cpu' ? 'CPU' : procSort === 'mem' ? '内存' : 'PID'} 排序`;
+    `显示 ${shown.length} / ${d.procs.count} 个进程 · 按 ${procSortLabels[key] || 'CPU'} 排序（点击表头切换）`;
   tbody.querySelectorAll('.kill-btn').forEach(btn => {
     btn.onclick = () => window.bridge.killProcess(parseInt(btn.dataset.pid, 10));
+  });
+  // 高亮当前排序列
+  document.querySelectorAll('#proc-table th.sortable').forEach(th => {
+    th.classList.toggle('sort-active', th.dataset.sort === procSort);
   });
 }
 
@@ -414,14 +429,23 @@ function switchView(v) {
   if (v === 'procs' && latest) renderProcs(latest);
 }
 document.querySelectorAll('.tab').forEach(t => { t.onclick = () => switchView(t.dataset.view); });
+// 直达某个性能卡片（cpu/gpu/mem/disk/net/batt），供启动参数/标记文件与卡片点击共用
+function selectCard(id) {
+  if (!detailDefs[id]) return;
+  activeCard = id;
+  bodyBuilt = false;
+  switchView('perf');
+  buildSidebar();
+  tickDetail(true);
+}
 document.getElementById('proc-search').addEventListener('input', e => {
   procQuery = e.target.value;
   if (latest) renderProcs(latest);
 });
-document.getElementById('th-cpu').onclick = () => {
-  procSort = procSort === 'cpu' ? 'pid' : procSort === 'pid' ? 'mem' : 'cpu';
-  if (latest) renderProcs(latest);
-};
+document.getElementById('th-cpu').onclick = () => { procSort = 'cpu'; if (latest) renderProcs(latest); };
+document.querySelectorAll('#proc-table th.sortable').forEach(th => {
+  th.onclick = () => { procSort = th.dataset.sort; if (latest) renderProcs(latest); };
+});
 window.addEventListener('keydown', e => {
   if (e.metaKey && e.key === '1') { e.preventDefault(); switchView('perf'); }
   else if (e.metaKey && e.key === '2') { e.preventDefault(); switchView('procs'); }
