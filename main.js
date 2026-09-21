@@ -1,9 +1,11 @@
 // 主进程：窗口 + macOS 本机数据采集
-const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, nativeTheme } = require('electron');
 const { exec } = require('child_process');
 const path = require('path');
 
 app.setName('任务管理器');
+// 界面为深色设计：锁定深色外观，避免系统浅色模式下毛玻璃变白导致文字不可读
+nativeTheme.themeSource = 'dark';
 
 let win = null;
 
