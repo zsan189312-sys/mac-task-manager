@@ -356,23 +356,26 @@ function tickDetail(force) {
     body.innerHTML = detailDefs[activeCard].build(latest);
     bodyBuilt = true;
   }
-  detailDefs[activeCard].update(latest);
+  // 分段异常隔离：任一段渲染失败不影响其余字段更新（避免信息栏数值冻结）
+  try { detailDefs[activeCard].update(latest); } catch (e) { console.error('detail.update', e); }
   setText('detail-title', titleMap[activeCard]); // 标题跟随当前卡片（修复 GPU 页标题残留 CPU）
   // 大图 + 轴标注
-  const color = cardColor[activeCard];
-  const big = document.getElementById('bigchart');
-  if (activeCard === 'net') {
-    drawOverlaid(big, hist.netrx, hist.nettx, '#ffd60a', '#ff453a');
-    setText('chart-max', fmtRate(Math.max(...hist.netrx, ...hist.nettx, 0.001)));
-  } else {
-    const series = { cpu: hist.cpu, mem: hist.mem, gpu: hist.gpu, disk: hist.disk, batt: hist.batt };
-    const yMax = (activeCard === 'mem' || activeCard === 'gpu' || activeCard === 'batt') ? 100 : undefined;
-    drawSeries(big, series[activeCard], color, yMax);
-    setText('chart-max', activeCard === 'batt' ? '100%'
-      : activeCard === 'disk' ? fmtRate(Math.max(...hist.disk, 0.0001) * 1024 * 1024)
-      : (activeCard === 'mem' || activeCard === 'gpu') ? '100%' : '');
-  }
-  setText('detail-meta', detailDefs[activeCard].meta(latest));
+  try {
+    const color = cardColor[activeCard];
+    const big = document.getElementById('bigchart');
+    if (activeCard === 'net') {
+      drawOverlaid(big, hist.netrx, hist.nettx, '#ffd60a', '#ff453a');
+      setText('chart-max', fmtRate(Math.max(...hist.netrx, ...hist.nettx, 0.001)));
+    } else {
+      const series = { cpu: hist.cpu, mem: hist.mem, gpu: hist.gpu, disk: hist.disk, batt: hist.batt };
+      const yMax = (activeCard === 'mem' || activeCard === 'gpu' || activeCard === 'batt') ? 100 : undefined;
+      drawSeries(big, series[activeCard], color, yMax);
+      setText('chart-max', activeCard === 'batt' ? '100%'
+        : activeCard === 'disk' ? fmtRate(Math.max(...hist.disk, 0.0001) * 1024 * 1024)
+        : (activeCard === 'mem' || activeCard === 'gpu') ? '100%' : '');
+    }
+  } catch (e) { console.error('detail.chart', e); }
+  try { setText('detail-meta', detailDefs[activeCard].meta(latest)); } catch (e) { }
 }
 
 // ---------- 进程 ----------
@@ -391,16 +394,19 @@ function renderProcs(d) {
     const dTotal = p.diskRead + p.diskWrite;
     const ioTxt = dTotal > 0 ? `R ${fmtRate(p.diskRead)} / W ${fmtRate(p.diskWrite)}` : '<span style="opacity:.35">—</span>';
     const netTxt = (p.rx + p.tx) > 0 ? `<span style="color:#ffd60a">↓ ${fmtRate(p.rx)}</span> <span style="color:#ff453a">↑ ${fmtRate(p.tx)}</span>` : '<span style="opacity:.35">—</span>';
+    const nameStyle = p.pseudo ? 'max-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.6' : 'max-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+    const killTd = p.pseudo ? '<td style="text-align:right;opacity:.3">—</td>'
+      : `<td style="text-align:right"><button class="kill-btn" data-pid="${p.pid}">退出</button></td>`;
     return `
-    <tr>
-      <td class="td-num" style="color:var(--text-3)">${p.pid}</td>
-      <td style="max-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(p.name)}</td>
+    <tr${p.pseudo ? ' style="opacity:.75"' : ''}>
+      <td class="td-num" style="color:var(--text-3)">${p.pseudo ? '—' : p.pid}</td>
+      <td style="${nameStyle}">${esc(p.name)}</td>
       <td class="td-num ${p.cpu > 30 ? 'cpu-hot' : ''}">${p.cpu.toFixed(1)}</td>
       <td class="td-num">${fmtSize(p.rss)}</td>
       <td class="td-num"><span class="io-detail">${ioTxt}</span></td>
       <td class="td-num">${netTxt}</td>
       <td class="td-num">${p.energy.toFixed(1)}</td>
-      <td style="text-align:right"><button class="kill-btn" data-pid="${p.pid}">退出</button></td>
+      ${killTd}
     </tr>`;
   }).join('');
   document.getElementById('proc-summary').textContent =

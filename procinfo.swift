@@ -1,7 +1,7 @@
 // procinfo — 枚举全部进程（KERN_PROC_ALL，含 root/系统进程）并采集资源数据
-// 输出（制表符分隔）：pid \t cpu_ns \t diskR \t diskW \t wakeups \t rss \t path
-// 说明：macOS 上 kinfo_proc.p_cpticks 已不再维护（恒为 0），故 CPU 时间改用
-//       proc_pidinfo(PROC_PIDTASKINFO) 的 pti_total_user + pti_total_system（纳秒）
+// 输出（制表符分隔）：pid \t cpu_ns \t rcpu_ns \t diskR \t diskW \t wakeups \t rss \t path
+// cpu_ns  = proc_pidinfo(PROC_PIDTASKINFO) 的 pti_total_user+system（macOS 27 不计 darwinbg/nice 线程）
+// rcpu_ns = proc_pid_rusage 的 ri_user_time+ri_system_time（含后台 QoS，口径更全）
 import Foundation
 
 // ---------- 1) sysctl KERN_PROC_ALL 枚举所有进程（与 ps 同源，无 uid 过滤） ----------
@@ -27,7 +27,7 @@ buf.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
         let pid = Int(kp.kp_proc.p_pid)
         guard pid > 0 else { continue }
 
-        // ---------- 2) CPU 时间（纳秒）+ 常驻内存 ----------
+        // ---------- 2) CPU 时间（纳秒，两种口径）+ 常驻内存 ----------
         var cpuNs: UInt64 = 0
         var rssTask: UInt64 = 0
         var ti = proc_taskinfo()
@@ -42,8 +42,9 @@ buf.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             rssTask = ti.pti_resident_size
         }
 
-        // ---------- 3) 磁盘 I/O / 唤醒次数（部分系统进程可能拒绝，置 0 继续列出） ----------
+        // ---------- 3) 磁盘 I/O / 唤醒次数 / rusage 口径 CPU（部分系统进程可能拒绝，置 0 继续列出） ----------
         var diskR: UInt64 = 0, diskW: UInt64 = 0, wkups: UInt64 = 0, rssRu: UInt64 = 0
+        var rcpuNs: UInt64 = 0
         var stat = rusage_info_current()
         let r = withUnsafeMutablePointer(to: &stat) {
             $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) {
@@ -55,6 +56,7 @@ buf.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             diskW = stat.ri_diskio_byteswritten
             wkups = stat.ri_pkg_idle_wkups
             rssRu = stat.ri_resident_size
+            rcpuNs = stat.ri_user_time + stat.ri_system_time
         }
         let rss = rssRu > 0 ? rssRu : rssTask
 
@@ -63,7 +65,7 @@ buf.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
         let plen = proc_pidpath(Int32(pid), &pathBuf, UInt32(pathBuf.count))
         let path = plen > 0 ? String(cString: pathBuf) : ""
 
-        out += "\(pid)\t\(cpuNs)\t\(diskR)\t\(diskW)\t\(wkups)\t\(rss)\t\(path)\n"
+        out += "\(pid)\t\(cpuNs)\t\(rcpuNs)\t\(diskR)\t\(diskW)\t\(wkups)\t\(rss)\t\(path)\n"
     }
 }
 print(out, terminator: "")

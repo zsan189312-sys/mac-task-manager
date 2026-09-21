@@ -89,6 +89,7 @@ async function getStatic() {
 // ---------- 采集器 ----------
 const CPU_HELPER = path.join(__dirname, 'bin', 'cpucores');
 let lastCoreTicks = null;     // 每核 [user, system, idle, nice]
+let lastHostFrac = null;      // 机器级 CPU 占比 { user, sys }（0-1，含 nice 于 user），供进程页聚合估算
 let lastIfaces = null;        // { name: {ibytes, obytes} }
 
 async function gatherCPU() {
@@ -115,9 +116,12 @@ async function gatherCPU() {
       });
       if (busySum.t > 0) {
         usage = (busySum.b / busySum.t) * 100;
-        user = (busySum.u / busySum.t) * 100;
+        // 用户占比并入 nice（后台 QoS/nice 线程），与活动监视器"用户"口径一致
+        user = ((busySum.u + (busySum.b - busySum.u - busySum.s)) / busySum.t) * 100;
         sys = (busySum.s / busySum.t) * 100;
         idle = 100 - usage;
+        // 记录机器级占比（0-1），供进程页做 kernel/受保护系统进程聚合估算
+        lastHostFrac = { user: usage / 100 - (busySum.s / busySum.t), sys: busySum.s / busySum.t };
       }
       const types = staticInfo ? staticInfo.coreTypes : null;
       if (types && types.length === coreLoads.length) {
@@ -320,8 +324,9 @@ async function gatherProcs() {
   const lines = out.trim().split('\n').filter(Boolean);
   lines.forEach(line => {
     const p = line.split('\t');
-    if (p.length < 7) return;
-    cur[p[0]] = { cpuNs: +p[1], dR: +p[2], dW: +p[3], wk: +p[4], rss: +p[5], path: p[6] || '' };
+    if (p.length < 8) return;
+    // taskinfo 与 rusage 两种口径取较大值（macOS 27 对 darwinbg/nice 线程均有漏计）
+    cur[p[0]] = { cpuNs: Math.max(+p[1] || 0, +p[2] || 0), dR: +p[3], dW: +p[4], wk: +p[5], rss: +p[6], path: p[7] || '' };
   });
 
   // 兜底：procinfo 被阻断时回退旧 ps 方案
@@ -329,8 +334,21 @@ async function gatherProcs() {
     return await gatherProcsPsFallback(iv, now);
   }
 
-  // 2) 差分合成进程列表（网速来自常驻 nettop 流的累计字节差分）
+  // 2) ps 补充源：macOS 27 的 taskinfo/rusage 不计 darwinbg/nice 线程的 CPU 时间，
+  //    ps 的 pcpu（衰减均值）能看到，例如挖矿类进程。两者取较大值。
+  let psCpu = {};
+  try {
+    const psOut = await run('ps -axo pid=,pcpu=', 5000);
+    psOut.trim().split('\n').forEach(line => {
+      const m = line.trim().match(/^(\d+)\s+([\d.]+)$/);
+      if (m) psCpu[m[1]] = parseFloat(m[2]);
+    });
+  } catch (e) { }
+
+  // 3) 差分合成进程列表（网速来自常驻 nettop 流的累计字节差分）
+  const ncpu = (staticInfo && staticInfo.cores) || 10;
   const procs = [];
+  let attrFrac = 0; // 可读进程的 CPU 占机器比例合计
   for (const [pid, c] of Object.entries(cur)) {
     const prev = lastProcRaw ? lastProcRaw[pid] : null;
     const nPrev = liveNet[pid];
@@ -343,6 +361,9 @@ async function gatherProcs() {
       const wkRate = Math.max(0, (c.wk - prev.wk) / iv);
       energy = cpu + wkRate * 0.5; // 能耗影响估算：CPU 占用 + 每秒唤醒数
     }
+    const psVal = psCpu[pid] || 0;
+    if (psVal > cpu) { cpu = psVal; energy = Math.max(energy, cpu); }
+    attrFrac += cpu / 100 / ncpu;
     if (nPrev) {
       rx = Math.max(0, (nPrev.rx - (prev ? (prev.rx0 || 0) : 0)) / iv);
       tx = Math.max(0, (nPrev.tx - (prev ? (prev.tx0 || 0) : 0)) / iv);
@@ -350,6 +371,17 @@ async function gatherProcs() {
     const full = c.path || '';
     const name = full.includes('/') ? full.slice(full.lastIndexOf('/') + 1) : (full || '(未知)');
     procs.push({ pid: parseInt(pid, 10), name, cpu, rss: c.rss, diskRead, diskWrite, rx, tx, energy });
+  }
+
+  // 3) 聚合估算行：macOS 27 收紧了跨用户读取（WindowServer 等 root 进程 taskinfo 被拒），
+  //    且 darwinbg/nice 线程的 CPU 时间不计入 taskinfo/rusage。用 host ticks 补齐缺口，
+  //    使进程页 CPU 合计 ≈ 性能页总利用率。
+  const realCount = procs.length;
+  if (lastHostFrac && lastProcRaw) {
+    const kernelPct = Math.max(0, lastHostFrac.sys) * ncpu * 100;
+    const protPct = Math.max(0, lastHostFrac.user - attrFrac) * ncpu * 100;
+    procs.push({ pid: 0, name: 'kernel_task（内核）', cpu: kernelPct, rss: 0, diskRead: 0, diskWrite: 0, rx: 0, tx: 0, energy: 0, pseudo: true });
+    procs.push({ pid: -1, name: '系统进程（受保护·聚合估算）', cpu: protPct, rss: 0, diskRead: 0, diskWrite: 0, rx: 0, tx: 0, energy: 0, pseudo: true });
   }
   procs.sort((a, b) => b.cpu - a.cpu);
 
@@ -360,7 +392,7 @@ async function gatherProcs() {
   }
   lastProcRaw = rawWithNet;
   lastProcsTime = now;
-  return { count: procs.length, list: procs.slice(0, 300) };
+  return { count: realCount, list: procs.slice(0, 300) };
 }
 
 // 旧方案兜底（procinfo 被系统策略阻断时）
