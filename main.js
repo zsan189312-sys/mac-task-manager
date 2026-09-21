@@ -255,13 +255,36 @@ async function gatherWifi() {
 async function gatherBattery() {
   const out = await run('pmset -g batt');
   const pct = (out.match(/(\d+)%/) || [])[1];
-  const charging = /AC Power/.test(out);
   const time = (out.match(/(\d+:\d+)\s+remaining/) || [])[1] || '';
+  // ioreg AppleSmartBattery：实时电压/电流/功率/循环次数/健康度
+  const io = await run('ioreg -r -c AppleSmartBattery -w 0 2>/dev/null', 5000);
+  const num = (k) => {
+    const m = io.match(new RegExp('"' + k + '"\\s*=\\s*(-?\\d+)'));
+    if (!m) return null;
+    let n = parseInt(m[1], 10);
+    if (n > 9007199254740991) n = n - Math.pow(2, 64); // 64位无符号回绕成负数（放电电流）
+    return n;
+  };
+  const bool = (k) => new RegExp('"' + k + '"\\s*=\\s*Yes').test(io);
+  const voltage = num('Voltage');           // mV
+  const amperage = num('InstantAmperage');  // mA，正=充电 负=放电
+  const external = bool('ExternalConnected');
+  const isCharging = bool('IsCharging');
+  const nom = num('NominalChargeCapacity'), des = num('DesignCapacity');
+  // 状态自动跟随：放电中 / 充电中 / 已接通电源（不在充电）
+  const status = !external ? 'discharging' : (isCharging ? 'charging' : 'external');
   return {
     percent: pct ? parseInt(pct, 10) : null,
-    charging,
+    present: !!pct,
+    external,
+    charging: isCharging,
+    status,
     timeRemaining: time,
-    present: !!pct
+    voltage: voltage ? voltage / 1000 : null,   // V
+    amperage,                                    // mA
+    watts: voltage && amperage ? (voltage * amperage) / 1e6 : null, // W，正=充电输入 负=放电输出
+    cycle: num('CycleCount'),
+    health: nom && des ? Math.round(nom / des * 1000) / 10 : null
   };
 }
 
@@ -458,7 +481,11 @@ async function poll() {
     ]);
     // 低频：每 30 秒（变化很慢的指标）
     if (tick === 1 || tick % 15 === 0) {
-      [lastBatt, lastWifi] = await Promise.all([gatherBattery(), gatherWifi()]);
+      lastWifi = await gatherWifi();
+    }
+    // 电池每 6 秒（电流/功率随负载变化较快）
+    if (tick === 1 || tick % 3 === 1) {
+      lastBatt = await gatherBattery();
     }
     // 慢车道：每 6 秒
     if (tick === 1 || tick % 3 === 2) lastVolumes = await gatherVolumes();

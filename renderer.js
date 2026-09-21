@@ -105,7 +105,10 @@ function updateSidebar(d) {
   setText('sub-disk', `${fmtSize(vol.used)} / ${fmtSize(vol.total)} · ${fmtRate(d.disk.mbps * 1024 * 1024)}`);
   const en0 = d.net.ifaces.find(i => i.name === 'en0') || d.net.ifaces[0];
   setText('sub-net', d.wifi ? `Wi-Fi · ${d.wifi}` : (en0 ? 'Wi-Fi · 已连接' : '未连接'));
-  setText('sub-batt', d.batt.present ? `${d.batt.percent}%${d.batt.charging ? ' · 充电中' : ''}` : '无电池');
+  setText('sub-batt', !d.batt.present ? '无电池'
+    : d.batt.status === 'charging' ? `${d.batt.percent}% · 充电中`
+    : d.batt.status === 'external' ? `${d.batt.percent}% · 已接通电源`
+    : `${d.batt.percent}% · 放电中`);
   setText('sub-gpu', d.gpu.util === null ? '—' : `${d.gpu.util.toFixed(0)}% · ${fmtSize(d.gpu.memBytes)}`);
 
   drawSeries(document.getElementById('spark-cpu'), hist.cpu, '#0a84ff');
@@ -335,17 +338,42 @@ const detailDefs = {
           <div class="info-item"><div class="info-label">电量</div><div class="info-value" id="batt-pct">—</div></div>
           <div class="info-item"><div class="info-label">状态</div><div class="info-value" id="batt-state">—</div></div>
           <div class="info-item"><div class="info-label"><span id="batt-time-label">可用</span>时间</div><div class="info-value" id="batt-time">—</div></div>
+          <div class="info-item"><div class="info-label">实时电流</div><div class="info-value" id="batt-amp">—</div></div>
+          <div class="info-item"><div class="info-label">电压</div><div class="info-value" id="batt-volt">—</div></div>
+          <div class="info-item"><div class="info-label">实时功率</div><div class="info-value" id="batt-watt">—</div></div>
+          <div class="info-item"><div class="info-label">电池健康</div><div class="info-value" id="batt-health">—</div></div>
         </div>
         <div class="section-title">近 60 秒电量曲线</div>`;
     },
     update(d) {
       const b = d.batt;
       setText('batt-pct', b.present ? b.percent + '%' : '—');
-      setText('batt-state', b.present ? (b.charging ? '⚡ 充电中' : '🔋 电池供电') : '无电池');
+      // 状态自动跟随充电/放电切换
+      const stateTxt = !b.present ? '无电池'
+        : b.status === 'charging' ? '⚡ 充电中'
+        : b.status === 'external' ? '🔌 已接通电源'
+        : '🔋 放电中';
+      setText('batt-state', stateTxt);
       setText('batt-time', b.timeRemaining || '—');
-      setText('batt-time-label', b.charging ? '充满' : '可用');
+      setText('batt-time-label', b.status === 'charging' ? '充满' : '可用');
+      // 实时电流/电压/功率（正=充电输入，负=放电输出）
+      if (b.amperage !== null && b.amperage !== undefined) {
+        const a = Math.abs(b.amperage) / 1000;
+        setText('batt-amp', `${b.amperage >= 0 ? '+' : '−'}${a.toFixed(2)} A${b.amperage >= 0 ? '（充入）' : '（输出）'}`);
+      } else setText('batt-amp', '—');
+      setText('batt-volt', b.voltage ? b.voltage.toFixed(2) + ' V' : '—');
+      if (b.watts !== null && b.watts !== undefined) {
+        setText('batt-watt', `${b.watts >= 0 ? '+' : '−'}${Math.abs(b.watts).toFixed(1)} W${b.watts >= 0 ? '（充入）' : '（输出）'}`);
+      } else setText('batt-watt', '—');
+      setText('batt-health', b.health ? `${b.health}%（${b.cycle || '—'} 次循环）` : '—');
     },
-    meta(d) { return d.batt.charging ? '已接通电源' : '使用电池'; }
+    meta(d) {
+      const b = d.batt;
+      if (!b.present) return '无电池';
+      if (b.status === 'charging') return `已接通电源${b.watts ? ' · 充电输入 ' + Math.abs(b.watts).toFixed(1) + ' W' : ''}`;
+      if (b.status === 'external') return '已接通电源 · 电池不在充放电';
+      return `使用电池${b.watts ? ' · 输出 ' + Math.abs(b.watts).toFixed(1) + ' W' : ''}`;
+    }
   }
 };
 
