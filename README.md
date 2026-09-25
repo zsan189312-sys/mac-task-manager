@@ -8,9 +8,17 @@
 
 ![性能页](docs/screenshots/performance.png)
 
-**进程页** — 800 进程实时 CPU 差分排序、搜索、一键强制退出：
+**进程页** — 880+ 进程全量枚举（含系统进程），七列实时数据：整机占比 CPU、内存、磁盘读/写、网速 ↓↑、能耗（瓦数）：
 
 ![进程页](docs/screenshots/processes.png)
+
+**电池页** — 实时电压 / 电流 / 功率 + 循环次数与健康度，充放电状态自动切换：
+
+![电池页](docs/screenshots/battery.png)
+
+**GPU 页** — 利用率 / 渲染器 / 分块器 / 显存（IOAccelerator 用户态采样）：
+
+![GPU 页](docs/screenshots/gpu.png)
 
 ## 特性
 
